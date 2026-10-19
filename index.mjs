@@ -352,18 +352,17 @@ function completionID() {
   return `chatcmpl-notion-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 }
 
-// Notion ends a reply at 30 seconds whether or not the model had finished:
-// two tests stopped at 30.05s and 30.10s with no completion event. A stream
-// that ran that long is a cut-off one, and the client should see it as such
-// (`finish_reason: "length"`) rather than as a complete answer.
-const NOTION_CUTOFF_MS = 29000
+// The 30s ceiling was impit's client timeout, not Notion's (fixed at the
+// transport: a 39.5s reply now comes back complete). A long reply is no longer
+// evidence of a cut-off one, so nothing is marked truncated by duration.
+const NOTION_CUTOFF_MS = null
 
 function bufferedMessage(result) {
   const { content, toolCalls } = parseToolCalls(result.text)
   const message = { role: 'assistant', content: toolCalls.length ? content || null : result.text }
   if (toolCalls.length) message.tool_calls = toolCalls
   if (result.reasoning) message.reasoning_content = result.reasoning
-  const truncated = !toolCalls.length && (result.duration ?? 0) >= NOTION_CUTOFF_MS
+  const truncated = false
   return { message, toolCalls, truncated }
 }
 
