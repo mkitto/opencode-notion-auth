@@ -16,12 +16,69 @@ export function notionOrigin() {
   return (override || DEFAULT_ORIGIN).replace(/\/+$/, '')
 }
 
+// A TUN-less setup: this Notion line may leave through a proxy while the rest
+// of the machine stays direct. Magpie hands a plugin its proxy as
+// MAGPIE_HTTPS_PROXY, and Bun's fetch takes one per call — so it is attached
+// here instead of left to the environment, which Bun reads only once.
+const NOTION_PROXY = String(
+  globalThis.process?.env?.NOTION_PROXY ??
+    globalThis.process?.env?.MAGPIE_HTTPS_PROXY ??
+    globalThis.process?.env?.MAGPIE_HTTP_PROXY ??
+    globalThis.process?.env?.HTTPS_PROXY ??
+    globalThis.process?.env?.HTTP_PROXY ??
+    '',
+).trim()
+
+// Bun's fetch reads HTTPS_PROXY at request time; Magpie renames it to
+// MAGPIE_*_PROXY for the host so a plugin's env cannot push every child
+// through one. This plugin wants the proxy for its own requests only, so it
+// is put back here — nothing outside this process sees it.
+if (NOTION_PROXY) {
+  const env = globalThis.process?.env
+  if (env && !env.HTTPS_PROXY) env.HTTPS_PROXY = NOTION_PROXY
+  if (env && !env.HTTP_PROXY) env.HTTP_PROXY = NOTION_PROXY
+}
+
+/** fetch with the proxy this Notion line goes through, when one is set. */
+export function notionFetch(input, init = {}) {
+  return NOTION_PROXY ? fetch(input, { ...init, proxy: NOTION_PROXY }) : fetch(input, init)
+}
+
+// Notion checks the TLS fingerprint where a thread is created: a runtime's own
+// handshake — Bun's here — is answered 200 with `temporarily-unavailable`,
+// which reads as an empty reply. impit speaks Chrome's TLS, so the one call
+// that has to look like a browser goes through it; the rest keep plain fetch.
+let impitClient
+let impitLoading
+async function impitFetch(url, init) {
+  if (!impitClient) {
+    impitLoading ??= import('impit')
+      .then(({ Impit }) => (impitClient = new Impit({ browser: 'chrome', followRedirects: false })))
+      .catch((error) => {
+        impitLoading = undefined
+        throw new NotionError(`impit could not load, so Notion cannot be reached: ${error?.message ?? error}`, {
+          status: 503,
+        })
+      })
+    await impitLoading
+  }
+  try {
+    return await impitClient.fetch(String(url), init)
+  } catch (error) {
+    // Some impit builds refuse the per-request redirect option; the shared
+    // client already does not follow redirects, so dropping it is safe.
+    if (!/redirect/i.test(String(error?.message ?? ''))) throw error
+    const { redirect, ...withoutRedirect } = init
+    return impitClient.fetch(String(url), withoutRedirect)
+  }
+}
+
 export function apiURL(name) {
   return `${notionOrigin()}/api/v3/${name}`
 }
 
 /** The version header Notion's own bundle reports, read off its login page. */
-export async function fetchClientVersion({ signal, fetchImpl = fetch } = {}) {
+export async function fetchClientVersion({ signal, fetchImpl = notionFetch } = {}) {
   try {
     const res = await fetchImpl(`${notionOrigin()}/login`, {
       headers: {
@@ -78,7 +135,7 @@ export class NotionError extends Error {
   }
 }
 
-async function postJson(account, name, payload, { signal, fetchImpl = fetch, referer } = {}) {
+async function postJson(account, name, payload, { signal, fetchImpl = notionFetch, referer } = {}) {
   const res = await fetchImpl(apiURL(name), {
     method: 'POST',
     headers: apiHeaders(account, { referer }),
@@ -170,7 +227,7 @@ export function parseUserContent(payload) {
   return { userId, email, userName, ...best }
 }
 
-export async function loadAccount(account, { signal, fetchImpl = fetch } = {}) {
+export async function loadAccount(account, { signal, fetchImpl = notionFetch } = {}) {
   const payload = await postJson(account, 'loadUserContent', {}, { signal, fetchImpl })
   return parseUserContent(payload)
 }
@@ -180,7 +237,7 @@ export async function loadAccount(account, { signal, fetchImpl = fetch } = {}) {
  * answer nests the list in a string as often as not, so every JSON value the
  * payload holds is tried and the ones shaped like a model list are read.
  */
-export async function fetchAvailableModels(account, { signal, fetchImpl = fetch } = {}) {
+export async function fetchAvailableModels(account, { signal, fetchImpl = notionFetch } = {}) {
   if (!account?.spaceId) throw new NotionError('No space to ask for a model list about')
   const payload = await postJson(account, 'getAvailableModels', { spaceId: account.spaceId }, { signal, fetchImpl })
   const found = []
@@ -290,7 +347,7 @@ export function buildConfigValue({ notionModel = '', webSearch = false, readOnly
     enableScriptAgentMcpServers: false,
     enableScriptAgentMail: true,
     enableScriptAgentCalendar: true,
-    enableScriptAgentCustomToolCalling: false,
+    enableScriptAgentCustomToolCalling: true,
     enableCreateAndRunThread: true,
     enableSoftwareFactoryPage: false,
     enableAgentGenerateImage: false,
@@ -360,7 +417,7 @@ export function buildContextValue(account, { instructions = '' } = {}) {
  */
 export async function runInferenceTranscript(
   account,
-  { prompt, notionModel = '', webSearch = false, instructions = '', effort = '', signal, fetchImpl = fetch } = {},
+  { prompt, notionModel = '', webSearch = false, instructions = '', effort = '', signal, fetchImpl = notionFetch } = {},
 ) {
   const threadId = randomUUID()
   const configId = randomUUID()
@@ -408,7 +465,8 @@ export async function runInferenceTranscript(
     threadParentPointer: { table: 'space', id: account.spaceId, spaceId: account.spaceId },
   }
 
-  const res = await fetchImpl(apiURL('runInferenceTranscript'), {
+  const runFetch = fetchImpl === notionFetch ? impitFetch : fetchImpl
+  const res = await runFetch(apiURL('runInferenceTranscript'), {
     method: 'POST',
     headers: apiHeaders(account, { accept: 'application/x-ndjson', referer: `${notionOrigin()}/ai` }),
     body: JSON.stringify(body),

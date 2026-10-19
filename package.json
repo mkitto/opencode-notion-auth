@@ -40,5 +40,8 @@
   "magpie": {
     "icon": "https://www.notion.so/images/logo-ios.png",
     "maxConcurrency": 1
+  },
+  "dependencies": {
+    "impit": "0.14.6"
   }
 }

@@ -6,7 +6,7 @@
 // user reads the code out of their mail and types it in.
 
 import { randomUUID } from 'node:crypto'
-import { FALLBACK_CLIENT_VERSION, NotionError, apiURL, fetchClientVersion, notionOrigin } from './notion-api.mjs'
+import { FALLBACK_CLIENT_VERSION, NotionError, apiURL, fetchClientVersion, notionFetch, notionOrigin } from './notion-api.mjs'
 import { createCookieJar, hasToken } from './cookies.mjs'
 
 const USER_AGENT =
@@ -35,7 +35,7 @@ function loginError(step, response, text) {
   )
 }
 
-async function postLogin(step, path, payload, { jar, clientVersion, signal, fetchImpl = fetch, userId = '' }) {
+async function postLogin(step, path, payload, { jar, clientVersion, signal, fetchImpl = notionFetch, userId = '' }) {
   const headers = loginHeaders(clientVersion)
   if (jar.header()) headers.cookie = jar.header()
   if (userId) headers['x-notion-active-user-header'] = userId
@@ -60,7 +60,7 @@ async function postLogin(step, path, payload, { jar, clientVersion, signal, fetc
  * Asks Notion for a code by email. What comes back is everything the second
  * half of the login needs, so nothing has to be kept on the side.
  */
-export async function startEmailLogin(email, { signal, fetchImpl = fetch } = {}) {
+export async function startEmailLogin(email, { signal, fetchImpl = notionFetch } = {}) {
   const address = (email || '').trim()
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(address)) {
     throw new NotionError('enter a full email address')
@@ -108,7 +108,7 @@ export async function startEmailLogin(email, { signal, fetchImpl = fetch } = {})
 }
 
 /** Hands the code back, and keeps the cookie that comes with it. */
-export async function finishEmailLogin(state, code, { signal, fetchImpl = fetch } = {}) {
+export async function finishEmailLogin(state, code, { signal, fetchImpl = notionFetch } = {}) {
   const password = (code || '').trim()
   if (!password) throw new NotionError('enter the code from the email')
   const payload = await postLogin(

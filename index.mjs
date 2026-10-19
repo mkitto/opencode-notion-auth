@@ -21,10 +21,15 @@ import {
 import { finishEmailLogin, startEmailLogin } from './notion-login.mjs'
 import { readBrowserSession } from './browser-cookies.mjs'
 import { applyTranscriptLine, createLineReader, createTranscript, transcriptReasoning, transcriptText } from './ndjson.mjs'
-import { buildPrompt, parseToolCalls } from './prompt.mjs'
+import { buildPrompt, buildRepairPrompt, looksLikeRefusal, parseToolCalls } from './prompt.mjs'
 
 const PROVIDER = 'notion'
 const VERSION = '0.1.0'
+
+// Notion's own web search, off unless the launcher asks for it
+// (NOTION_WEB_SEARCH=1): every turn then carries a search round trip, which
+// costs time the caller may not want to pay by default.
+const WEB_SEARCH = /^(1|true|yes|on)$/i.test(String(globalThis.process?.env?.NOTION_WEB_SEARCH ?? ''))
 
 // Notion's own model codes, with the names its picker shows. A model's key in
 // magpie is the friendly id; `id` is the code the upstream request carries.
@@ -298,6 +303,7 @@ function errorResponse(error) {
 
 /** Reads Notion's NDJSON reply, reporting the text as it grows. */
 async function consumeTranscript(stream, onProgress, { signal, threadId } = {}) {
+  const startedAt = Date.now()
   const lines = createLineReader()
   const decoder = new TextDecoder()
   const state = createTranscript()
@@ -339,29 +345,36 @@ async function consumeTranscript(stream, onProgress, { signal, threadId } = {}) 
     }
   }
   if (signal?.aborted) throw new NotionError('the client stopped waiting for this request')
-  return { text: transcriptText(state) || latest, reasoning: transcriptReasoning(state) }
+  return { text: transcriptText(state) || latest, reasoning: transcriptReasoning(state), duration: Date.now() - startedAt }
 }
 
 function completionID() {
   return `chatcmpl-notion-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 }
 
+// Notion ends a reply at 30 seconds whether or not the model had finished:
+// two tests stopped at 30.05s and 30.10s with no completion event. A stream
+// that ran that long is a cut-off one, and the client should see it as such
+// (`finish_reason: "length"`) rather than as a complete answer.
+const NOTION_CUTOFF_MS = 29000
+
 function bufferedMessage(result) {
   const { content, toolCalls } = parseToolCalls(result.text)
   const message = { role: 'assistant', content: toolCalls.length ? content || null : result.text }
   if (toolCalls.length) message.tool_calls = toolCalls
   if (result.reasoning) message.reasoning_content = result.reasoning
-  return { message, toolCalls }
+  const truncated = !toolCalls.length && (result.duration ?? 0) >= NOTION_CUTOFF_MS
+  return { message, toolCalls, truncated }
 }
 
 function bufferedResponse({ model, result }) {
-  const { message, toolCalls } = bufferedMessage(result)
+  const { message, toolCalls, truncated } = bufferedMessage(result)
   return jsonResponse(200, {
     id: completionID(),
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
     model,
-    choices: [{ index: 0, message, finish_reason: toolCalls.length ? 'tool_calls' : 'stop' }],
+    choices: [{ index: 0, message, finish_reason: toolCalls.length ? 'tool_calls' : truncated ? 'length' : 'stop' }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   })
 }
@@ -396,7 +409,7 @@ function streamingResponse({ model, upstream, signal, threadId, deferContent }) 
               },
           { signal, threadId },
         )
-        const { message, toolCalls } = bufferedMessage(result)
+        const { message, toolCalls, truncated } = bufferedMessage(result)
         if (deferContent) {
           if (message.content) send(chunk({ content: message.content }))
           if (message.reasoning_content) send(chunk({ reasoning_content: message.reasoning_content }))
@@ -415,8 +428,15 @@ function streamingResponse({ model, upstream, signal, threadId, deferContent }) 
               'tool_calls',
             ),
           )
+        } else if (!String(result.text ?? '').trim()) {
+          // Nothing at all: an overloaded turn. Say so, rather than ending on
+          // an empty reply the client reads as a refusal.
+          send({
+            ...chunk({}, 'stop'),
+            error: { message: 'Notion returned an empty reply (likely rate limited); retry the turn', type: 'empty_reply' },
+          })
         } else {
-          send(chunk({}, 'stop'))
+          send(chunk({}, truncated ? 'length' : 'stop'))
         }
       } catch (error) {
         send({ ...chunk({}, 'stop'), error: { message: error?.message || 'Notion request failed', type: 'api_error' } })
@@ -427,6 +447,67 @@ function streamingResponse({ model, upstream, signal, threadId, deferContent }) 
     },
     cancel() {
       Promise.resolve(upstream?.cancel?.()).catch(() => {})
+    },
+  })
+  return new Response(body, {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' },
+  })
+}
+
+/**
+ * The same SSE shape, built from a reply that was already read to its end so it
+ * could be inspected (a tool turn, or a repaired one). A call cannot be told
+ * from prose until the reply closes, so the client sees it in one piece anyway.
+ */
+function bufferedStreamingResponse({ model, result }) {
+  const id = completionID()
+  const created = Math.floor(Date.now() / 1000)
+  const encoder = new TextEncoder()
+  const body = new ReadableStream({
+    start(controller) {
+      const send = (payload) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`))
+      const chunk = (delta, finishReason) => ({
+        id,
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        choices: [{ index: 0, delta, finish_reason: finishReason ?? null }],
+      })
+      try {
+        const { message, toolCalls, truncated } = bufferedMessage(result)
+        if (message.content) send(chunk({ content: message.content }))
+        if (message.reasoning_content) send(chunk({ reasoning_content: message.reasoning_content }))
+        if (toolCalls.length) {
+          send(
+            chunk(
+              {
+                tool_calls: toolCalls.map((call, index) => ({
+                  index,
+                  id: call.id,
+                  type: 'function',
+                  function: call.function,
+                })),
+              },
+              'tool_calls',
+            ),
+          )
+        } else if (!String(result.text ?? '').trim()) {
+          // Nothing at all: an overloaded turn. Say so, rather than ending on
+          // an empty reply the client reads as a refusal.
+          send({
+            ...chunk({}, 'stop'),
+            error: { message: 'Notion returned an empty reply (likely rate limited); retry the turn', type: 'empty_reply' },
+          })
+        } else {
+          send(chunk({}, truncated ? 'length' : 'stop'))
+        }
+      } catch (error) {
+        send({ ...chunk({}, 'stop'), error: { message: error?.message || 'Notion request failed', type: 'api_error' } })
+      } finally {
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+        controller.close()
+      }
     },
   })
   return new Response(body, {
@@ -473,20 +554,83 @@ export const NotionPlugin = async ({ client }) => ({
           }
           try {
             const account = await accountFor(auth, client, signal)
+            const parallelToolCalls = body.parallel_tool_calls !== false
             const built = buildPrompt(body.messages, {
               tools: body.tools,
-              parallelToolCalls: body.parallel_tool_calls !== false,
+              parallelToolCalls,
             })
             const requested = typeof body.model === 'string' ? body.model : 'auto'
-            const { response, threadId } = await runInferenceTranscript(account, {
+            const notionModel = requested === 'auto' ? '' : requested
+            const effort = requestedEffort(body)
+            let { response, threadId } = await runInferenceTranscript(account, {
               prompt: built.prompt,
-              notionModel: requested === 'auto' ? '' : requested,
+              notionModel,
               instructions: built.instructions,
-              effort: requestedEffort(body),
+              webSearch: WEB_SEARCH,
+              effort,
               signal,
             })
+            // A turn that carries tools is answered in one piece anyway, so it
+            // can be inspected before the client sees it: a reply that refused
+            // on Notion's own identity gets one repair round, because the caller
+            // is an agent that would have executed the action itself.
+            if (built.toolCount > 0) {
+              let result = await consumeTranscript(response.body, null, { signal, threadId })
+              // Notion answers an overloaded turn with nothing at all — the
+              // stream ends in under a second with no words. Asking once more
+              // after a moment is cheaper than handing the client an empty
+              // reply it cannot tell from a refusal.
+              if (!String(result.text ?? '').trim()) {
+                await new Promise((resolve) => setTimeout(resolve, 2500))
+                const again = await runInferenceTranscript(account, {
+                  prompt: built.prompt,
+                  notionModel,
+                  instructions: built.instructions,
+                  webSearch: WEB_SEARCH,
+                  effort,
+                  signal,
+                })
+                threadId = again.threadId
+                result = await consumeTranscript(again.response.body, null, { signal, threadId })
+              }
+              if (!parseToolCalls(result.text).toolCalls.length && looksLikeRefusal(result.text)) {
+                const repaired = buildRepairPrompt({
+                  messages: body.messages,
+                  tools: body.tools,
+                  parallelToolCalls,
+                })
+                const again = await runInferenceTranscript(account, {
+                  prompt: repaired.prompt,
+                  notionModel,
+                  instructions: repaired.instructions,
+                  webSearch: WEB_SEARCH,
+                  effort,
+                  signal,
+                })
+                threadId = again.threadId
+                const retried = await consumeTranscript(again.response.body, null, { signal, threadId })
+                if (parseToolCalls(retried.text).toolCalls.length || !looksLikeRefusal(retried.text)) {
+                  result = retried
+                }
+              }
+              if (body.stream === false) return bufferedResponse({ model: requested, result })
+              return bufferedStreamingResponse({ model: requested, result })
+            }
             if (body.stream === false) {
-              const result = await consumeTranscript(response.body, null, { signal, threadId })
+              let result = await consumeTranscript(response.body, null, { signal, threadId })
+              if (!String(result.text ?? '').trim()) {
+                await new Promise((resolve) => setTimeout(resolve, 2500))
+                const again = await runInferenceTranscript(account, {
+                  prompt: built.prompt,
+                  notionModel,
+                  instructions: built.instructions,
+                  webSearch: WEB_SEARCH,
+                  effort,
+                  signal,
+                })
+                threadId = again.threadId
+                result = await consumeTranscript(again.response.body, null, { signal, threadId })
+              }
               return bufferedResponse({ model: requested, result })
             }
             return streamingResponse({
@@ -494,7 +638,7 @@ export const NotionPlugin = async ({ client }) => ({
               upstream: response.body,
               signal,
               threadId,
-              deferContent: built.toolCount > 0,
+              deferContent: false,
             })
           } catch (error) {
             return errorResponse(error)
