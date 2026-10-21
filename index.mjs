@@ -31,7 +31,31 @@ const VERSION = '0.1.0'
 //   原代码空回复后只等 2.5s 再试，不够，于是把失败率原样透给了调用方（502）。
 //   默认 20s（实测安全值），可用 NOTION_EMPTY_RETRY_MS 覆盖；只在空回复时付代价。
 const EMPTY_RETRY_MS = Number(process.env.NOTION_EMPTY_RETRY_MS ?? 20000)
-const emptyRetryDelay = () => new Promise((resolve) => setTimeout(resolve, EMPTY_RETRY_MS))
+// ★ 本地改动（2026-10-21 晚）：premium 档（Opus/Sonnet）单轮要 ~60s，账号的
+//   turn 冷却比轻档更长——20s 跟不上，实测 opus-5.5 连撞 8 次全空。给它们更长的
+//   间隔；仍可用 NOTION_EMPTY_RETRY_MS_HEAVY 覆盖。
+const EMPTY_RETRY_MS_HEAVY = Number(process.env.NOTION_EMPTY_RETRY_MS_HEAVY ?? 70000)
+const HEAVY_MODEL = /opus|sonnet/i
+const emptyRetryDelay = (model = '') =>
+  new Promise((resolve) =>
+    setTimeout(resolve, HEAVY_MODEL.test(String(model)) ? EMPTY_RETRY_MS_HEAVY : EMPTY_RETRY_MS),
+  )
+
+// ★ 本地改动（2026-10-21 晚）：重试一次后仍是空，就是终局——账号在冷却里，
+//   这一轮不可能成功。此时若回 429 或 5xx，magpie 会再试 4 次、agent 再试 3 轮，
+//   把「等一分钟」放大成 18 分钟（实测）。400 会被原样透传，两层都不会重试。
+function emptyReplyResponse(model) {
+  return jsonResponse(400, {
+    error: {
+      message:
+        'Notion answered nothing twice in a row — the account is in a turn cooldown. ' +
+        'Not retryable: send a new message after a minute.',
+      type: 'empty_reply',
+      code: 'notion_empty_reply',
+      model,
+    },
+  })
+}
 
 // Notion's own web search, off unless the launcher asks for it
 // (NOTION_WEB_SEARCH=1): every turn then carries a search round trip, which
@@ -587,7 +611,7 @@ export const NotionPlugin = async ({ client }) => ({
               // after a moment is cheaper than handing the client an empty
               // reply it cannot tell from a refusal.
               if (!String(result.text ?? '').trim()) {
-                await emptyRetryDelay()
+                await emptyRetryDelay(requested)
                 const again = await runInferenceTranscript(account, {
                   prompt: built.prompt,
                   notionModel,
@@ -599,6 +623,8 @@ export const NotionPlugin = async ({ client }) => ({
                 threadId = again.threadId
                 result = await consumeTranscript(again.response.body, null, { signal, threadId })
               }
+              if (!parseToolCalls(result.text).toolCalls.length && !String(result.text ?? '').trim())
+                return emptyReplyResponse(requested)
               if (!parseToolCalls(result.text).toolCalls.length && looksLikeRefusal(result.text)) {
                 const repaired = buildRepairPrompt({
                   messages: body.messages,
@@ -630,7 +656,7 @@ export const NotionPlugin = async ({ client }) => ({
             {
               let result = await consumeTranscript(response.body, null, { signal, threadId })
               if (!String(result.text ?? '').trim()) {
-                await emptyRetryDelay()
+                await emptyRetryDelay(requested)
                 const again = await runInferenceTranscript(account, {
                   prompt: built.prompt,
                   notionModel,
@@ -642,6 +668,8 @@ export const NotionPlugin = async ({ client }) => ({
                 threadId = again.threadId
                 result = await consumeTranscript(again.response.body, null, { signal, threadId })
               }
+              if (!parseToolCalls(result.text).toolCalls.length && !String(result.text ?? '').trim())
+                return emptyReplyResponse(requested)
               if (body.stream === false) return bufferedResponse({ model: requested, result })
               return bufferedStreamingResponse({ model: requested, result })
             }
