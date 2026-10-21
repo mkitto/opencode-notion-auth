@@ -26,6 +26,13 @@ import { buildPrompt, buildRepairPrompt, looksLikeRefusal, parseToolCalls } from
 const PROVIDER = 'notion'
 const VERSION = '0.1.0'
 
+// ★ 本地改动（2026-10-21）：Notion 同一账号的 turn 有冷却期——撞上就回空文本。
+//   实测：串行间隔 5–8s 仍 ok/空 严格交替（约 50% 失败），间隔 20s → 8/8 全成功。
+//   原代码空回复后只等 2.5s 再试，不够，于是把失败率原样透给了调用方（502）。
+//   默认 20s（实测安全值），可用 NOTION_EMPTY_RETRY_MS 覆盖；只在空回复时付代价。
+const EMPTY_RETRY_MS = Number(process.env.NOTION_EMPTY_RETRY_MS ?? 20000)
+const emptyRetryDelay = () => new Promise((resolve) => setTimeout(resolve, EMPTY_RETRY_MS))
+
 // Notion's own web search, off unless the launcher asks for it
 // (NOTION_WEB_SEARCH=1): every turn then carries a search round trip, which
 // costs time the caller may not want to pay by default.
@@ -580,7 +587,7 @@ export const NotionPlugin = async ({ client }) => ({
               // after a moment is cheaper than handing the client an empty
               // reply it cannot tell from a refusal.
               if (!String(result.text ?? '').trim()) {
-                await new Promise((resolve) => setTimeout(resolve, 2500))
+                await emptyRetryDelay()
                 const again = await runInferenceTranscript(account, {
                   prompt: built.prompt,
                   notionModel,
@@ -615,10 +622,15 @@ export const NotionPlugin = async ({ client }) => ({
               if (body.stream === false) return bufferedResponse({ model: requested, result })
               return bufferedStreamingResponse({ model: requested, result })
             }
-            if (body.stream === false) {
+            // ★ 本地改动（2026-10-21）：原本只在 body.stream === false 时才做
+            //   「空回复 → 重试」，但 Magpie 对**不带 stream 字段**的请求按流式
+            //   处理，Hermes 的调用同样落在流式分支 ⇒ 那段重试永远不触发，
+            //   冷却期撞出的空回复被原样转成 502。改成先读完整，两条路径共用
+            //   同一重试。代价：失去逐字流式（notion 首字节本就 2–9s，收益有限）。
+            {
               let result = await consumeTranscript(response.body, null, { signal, threadId })
               if (!String(result.text ?? '').trim()) {
-                await new Promise((resolve) => setTimeout(resolve, 2500))
+                await emptyRetryDelay()
                 const again = await runInferenceTranscript(account, {
                   prompt: built.prompt,
                   notionModel,
@@ -630,15 +642,9 @@ export const NotionPlugin = async ({ client }) => ({
                 threadId = again.threadId
                 result = await consumeTranscript(again.response.body, null, { signal, threadId })
               }
-              return bufferedResponse({ model: requested, result })
+              if (body.stream === false) return bufferedResponse({ model: requested, result })
+              return bufferedStreamingResponse({ model: requested, result })
             }
-            return streamingResponse({
-              model: requested,
-              upstream: response.body,
-              signal,
-              threadId,
-              deferContent: false,
-            })
           } catch (error) {
             return errorResponse(error)
           }
